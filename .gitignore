@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Model files 
+checkpoints/
+*.bin
+*.safetensors
+*.pth
+*.ckpt
+merged_model/
+*.model
+
+# Data (auto-downloaded)
+data/
+datasets/
+*.csv
+*.json.gz
+*.parquet
+
+# Cache directories
+.cache/
+*.cache
+.huggingface/
+
+# Logs
+logs/*.out
+logs/*.err
+*.log
+
+# Results
+results/*.csv
+results/*.json
+
+# Keep directory structure but not contents
+!results/.gitkeep
+!logs/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+
+# Temporary files
+tmp/
+temp/
+*.tmp
