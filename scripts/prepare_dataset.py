@@ -1,19 +1,6 @@
 #!/usr/bin/env python3
 """
 Prepare Glaive-Code-Assistant dataset for training.
-
-This script:
-1. Downloads the Glaive-Code-Assistant dataset from HuggingFace
-2. Formats multi-turn conversations for Llama 2 chat format
-3. Saves preprocessed dataset for fast loading during training
-4. Verifies dataset size and integrity
-
-Usage:
-    # Full dataset (~136K samples)
-    python scripts/prepare_dataset.py
-    
-    # Subset for testing
-    python scripts/prepare_dataset.py --num_samples 10000
 """
 
 import os
@@ -26,40 +13,14 @@ def format_conversation_for_llama2(example):
     """
     Format Glaive conversation into Llama 2 chat template.
     
-    Llama 2 format:
-    <s>[INST] <<SYS>>
-    {system_prompt}
-    <</SYS>>
-    
-    {user_message} [/INST] {assistant_response}</s>
-    <s>[INST] {user_message} [/INST] {assistant_response}</s>
-    
-    Args:
-        example: Dataset example with 'system' and 'chat' fields
-    
-    Returns:
-        Dict with 'text' field containing formatted conversation
+    Glaive format: question + answer
+    Llama 2 format: <s>[INST] {question} [/INST] {answer}</s>
     """
-    system = example.get('system', 'You are a helpful coding assistant.')
-    chat = example['chat']
+    question = example['question']
+    answer = example['answer']
     
-    # Start conversation with system prompt
-    conversation = f"<s>[INST] <<SYS>>\n{system}\n<</SYS>>\n\n"
-    
-    # Add conversation turns
-    for i, turn in enumerate(chat):
-        role = turn['role']
-        content = turn['content']
-        
-        if role == 'user':
-            if i == 0:
-                # First user message (already has system prompt)
-                conversation += f"{content} [/INST] "
-            else:
-                # Subsequent user messages start new turn
-                conversation += f"<s>[INST] {content} [/INST] "
-        else:  # assistant
-            conversation += f"{content}</s>"
+    # Format as Llama 2 chat
+    conversation = f"<s>[INST] {question} [/INST] {answer}</s>"
     
     return {"text": conversation}
 
@@ -91,10 +52,6 @@ def prepare_glaive_dataset(num_samples=None, output_dir="./data"):
         print(f"✓ Loaded {len(dataset):,} samples")
     except Exception as e:
         print(f"✗ Error loading dataset: {e}")
-        print("\nTroubleshooting:")
-        print("1. Check internet connection on cluster")
-        print("2. Verify HuggingFace datasets library is installed")
-        print("3. Try: huggingface-cli login (if dataset requires auth)")
         return None
     
     # Subsample if requested
@@ -107,14 +64,12 @@ def prepare_glaive_dataset(num_samples=None, output_dir="./data"):
     
     # Format conversations
     print("\n[3/4] Formatting conversations for Llama 2...")
-    print("Converting multi-turn conversations to Llama 2 chat format...")
+    print("Converting question-answer pairs to Llama 2 chat format...")
     
-    original_columns = dataset.column_names
     dataset = dataset.map(
         format_conversation_for_llama2,
-        remove_columns=original_columns,
-        desc="Formatting conversations",
-        num_proc=4  # Use 4 processes for speed
+        remove_columns=dataset.column_names,
+        desc="Formatting conversations"
     )
     
     print(f"✓ Formatted {len(dataset):,} conversations")
@@ -168,26 +123,14 @@ def prepare_glaive_dataset(num_samples=None, output_dir="./data"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Prepare Glaive-Code-Assistant dataset for training",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Prepare full dataset (~136K samples)
-    python scripts/prepare_dataset.py
-    
-    # Prepare subset for quick testing
-    python scripts/prepare_dataset.py --num_samples 10000
-    
-    # Specify custom output directory
-    python scripts/prepare_dataset.py --output_dir ./my_data
-        """
+        description="Prepare Glaive-Code-Assistant dataset for training"
     )
     
     parser.add_argument(
         "--num_samples",
         type=int,
         default=None,
-        help="Number of samples to use (default: full dataset ~136K)"
+        help="Number of samples to use (default: full dataset)"
     )
     
     parser.add_argument(
