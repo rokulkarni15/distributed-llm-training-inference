@@ -10,6 +10,7 @@ Usage:
 
 import os
 import argparse
+import time
 import torch
 from datasets import load_from_disk
 from transformers import (
@@ -20,6 +21,7 @@ from transformers import (
     DataCollatorForLanguageModeling,
 )
 from peft import LoraConfig, get_peft_model, TaskType
+from training.utils import save_training_metrics, print_metrics_summary
 
 
 def parse_args():
@@ -113,6 +115,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    print("Tokenizer loaded")
     
     # Load model
     print("\n[2/5] Loading model...")
@@ -121,6 +124,7 @@ def main():
         torch_dtype=torch.float16,
         device_map="auto",
     )
+    print("Model loaded")
     
     # Apply LoRA
     print(f"\n[3/5] Applying LoRA (r={args.lora_r})...")
@@ -142,6 +146,7 @@ def main():
         raise FileNotFoundError(f"Dataset not found: {args.dataset_path}")
     
     dataset = load_from_disk(args.dataset_path)
+    print(f"Loaded {len(dataset):,} samples")
     
     def tokenize(examples):
         return tokenizer(
@@ -199,14 +204,13 @@ def main():
     )
     
     print("Trainer ready")
-    print(f"\nEffective batch size: {args.per_device_train_batch_size * args.gradient_accumulation_steps}")
+    print(f"Effective batch size: {args.per_device_train_batch_size * args.gradient_accumulation_steps}")
     
     # Train
     print("\n" + "="*70)
     print("STARTING BASELINE TRAINING")
     print("="*70)
     
-    import time
     start_time = time.time()
     
     trainer.train()
@@ -222,9 +226,51 @@ def main():
     trainer.save_model(final_dir)
     tokenizer.save_pretrained(final_dir)
     
-    print(f"\nTraining complete!")
-    print(f"Time: {training_time/3600:.2f} hours")
-    print(f"Saved to: {final_dir}")
+    print(f"\nModel saved to {final_dir}")
+    
+    # Collect Metrics
+    print("\n" + "="*70)
+    print("COLLECTING METRICS")
+    print("="*70)
+    
+    num_samples = len(tokenized)
+    
+    # Get final loss from training history
+    train_history = trainer.state.log_history
+    final_loss = None
+    for entry in reversed(train_history):
+        if 'loss' in entry:
+            final_loss = entry['loss']
+            break
+    
+    # Collect core metrics
+    metrics = {
+        "experiment": "baseline",
+        "num_gpus": 1,
+        "strategy": "pytorch_lora",
+        "training_time_hours": training_time / 3600,
+        "samples_per_second": (num_samples * args.num_train_epochs) / training_time,
+        "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
+        "final_loss": final_loss if final_loss is not None else 0.0,
+        "speedup": 1.0,  # Baseline is 1.0x
+        "efficiency_percent": 100.0,  # Baseline is 100%
+    }
+    
+    # Print and save metrics
+    print_metrics_summary(metrics)
+    save_training_metrics(metrics)
+    
+    # Final summary
+    print("\n" + "="*70)
+    print("BASELINE TRAINING COMPLETE!")
+    print("="*70)
+    print(f"\nTime: {training_time/3600:.2f} hours")
+    print(f"Throughput: {metrics['samples_per_second']:.1f} samples/sec")
+    print(f"Memory: {metrics['peak_memory_gb']:.2f} GB")
+    print(f"\nCheckpoints: {args.output_dir}")
+    print(f"Final model: {final_dir}")
+    print(f"Metrics: results/training_metrics.csv")
+    print()
 
 
 if __name__ == "__main__":
