@@ -14,6 +14,7 @@ Usage:
 
 import os
 import argparse
+import time
 import torch
 from datasets import load_from_disk
 from transformers import (
@@ -24,6 +25,13 @@ from transformers import (
     DataCollatorForLanguageModeling,
 )
 from peft import LoraConfig, get_peft_model, TaskType
+
+from training.utils import (
+    save_training_metrics,
+    print_metrics_summary,
+    create_experiment_name,
+    get_zero_stage_from_config
+)
 
 
 def parse_args():
@@ -49,8 +57,8 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./checkpoints/deepspeed_zero2",
-        help="Directory to save checkpoints"
+        default=None,
+        help="Directory to save checkpoints (auto-generated if not provided)"
     )
     
     parser.add_argument(
@@ -122,12 +130,26 @@ def main():
     is_distributed = world_size > 1
     is_main_process = local_rank in [-1, 0]
     
+    # Detect ZeRO stage and create experiment name
+    zero_stage = get_zero_stage_from_config(args.deepspeed_config)
+    experiment_name = create_experiment_name(world_size, zero_stage)
+    
+    # Set output directory based on experiment
+    if args.output_dir is None:
+        args.output_dir = f"./checkpoints/{experiment_name}"
+    
     # Only print from main process
     if is_main_process:
         print("\n" + "="*70)
-        print(f"DEEPSPEED ZeRO-2 TRAINING: PYTORCH + LORA + DeepSpeed ({world_size} GPU{'s' if world_size > 1 else ''})")
+        print(f"DEEPSPEED ZeRO-{zero_stage} TRAINING")
         print("="*70)
-        print("\nNOTE: Using DeepSpeed ZeRO-2 for optimizer + gradient state partitioning")
+        print(f"\nExperiment: {experiment_name}")
+        print(f"GPUs: {world_size}")
+        print(f"ZeRO Stage: {zero_stage}")
+        print(f"Config: {args.deepspeed_config}")
+        print(f"Output: {args.output_dir}")
+        print()
+        print(f"NOTE: Using DeepSpeed ZeRO-{zero_stage} for optimizer + gradient state partitioning")
         if is_distributed:
             print(f"Expected: Greater memory savings + {world_size}x speedup with {world_size} GPUs")
         else:
@@ -155,6 +177,9 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    if is_main_process:
+        print("Tokenizer loaded")
+    
     # Load model
     if is_main_process:
         print("\n[2/5] Loading model...")
@@ -173,6 +198,9 @@ def main():
             device_map="auto",
         )
     
+    if is_main_process:
+        print("Model loaded")
+    
     # Apply LoRA
     if is_main_process:
         print(f"\n[3/5] Applying LoRA (r={args.lora_r})...")
@@ -188,6 +216,7 @@ def main():
     model = get_peft_model(model, lora_config)
     if is_main_process:
         model.print_trainable_parameters()
+        print("LoRA applied")
     
     # Load dataset
     if is_main_process:
@@ -219,11 +248,8 @@ def main():
     if is_main_process:
         print("\n[5/5] Configuring training with DeepSpeed...")
     
-    # Adjust output directory based on number of GPUs
-    output_dir = f"{args.output_dir}_{world_size}gpu" if world_size > 1 else f"{args.output_dir}_1gpu"
-    
     training_args = TrainingArguments(
-        output_dir=output_dir,
+        output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -237,7 +263,7 @@ def main():
         
         # Logging
         logging_steps=10,
-        logging_dir=f"{output_dir}/logs",
+        logging_dir=f"{args.output_dir}/logs",
         
         # Saving - Save more frequently for cluster resilience
         save_strategy="steps",
@@ -266,20 +292,20 @@ def main():
     # Check for existing checkpoint
     resume_checkpoint = None
     if args.resume_from_checkpoint and is_main_process:
-        if os.path.exists(output_dir):
-            checkpoints = [d for d in os.listdir(output_dir) 
-                          if d.startswith("checkpoint-") and os.path.isdir(os.path.join(output_dir, d))]
+        if os.path.exists(args.output_dir):
+            checkpoints = [d for d in os.listdir(args.output_dir) 
+                          if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_dir, d))]
             if checkpoints:
                 # Get the latest checkpoint
                 latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("-")[1]))
-                resume_checkpoint = os.path.join(output_dir, latest_checkpoint)
+                resume_checkpoint = os.path.join(args.output_dir, latest_checkpoint)
                 print(f"\n✓ Found checkpoint: {resume_checkpoint}")
                 print("  Training will resume from this checkpoint")
             else:
                 print("\n✓ No checkpoint found, starting fresh training")
     
     if is_main_process:
-        print("Trainer ready with DeepSpeed ZeRO-2")
+        print("✓ Trainer configured with DeepSpeed ZeRO-2")
         total_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps * world_size
         print(f"\nEffective batch size: {total_batch_size}")
         print(f"  = {args.per_device_train_batch_size} (per_device) × {args.gradient_accumulation_steps} (grad_accum) × {world_size} (GPUs)")
@@ -287,29 +313,70 @@ def main():
     # Train
     if is_main_process:
         print("\n" + "="*70)
-        print("STARTING DEEPSPEED ZeRO-2 TRAINING")
+        print(f"STARTING TRAINING: {experiment_name.upper()}")
         print("="*70)
+        print()
     
-    import time
     start_time = time.time()
     
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     
     training_time = time.time() - start_time
     
-    # Save (only main process saves)
+    # Save and collect metrics (only main process)
     if is_main_process:
         print("\n" + "="*70)
         print("SAVING MODEL")
         print("="*70)
         
-        final_dir = f"{output_dir}/final"
+        final_dir = f"{args.output_dir}/final"
         trainer.save_model(final_dir)
         tokenizer.save_pretrained(final_dir)
         
-        print(f"\nTraining complete!")
-        print(f"Time: {training_time/3600:.2f} hours")
-        print(f"Saved to: {final_dir}")
+        print(f"✓ Model saved to {final_dir}")
+        
+        # Collect metrics
+        print("\n" + "="*70)
+        print("COLLECTING METRICS")
+        print("="*70)
+        
+        num_samples = len(tokenized)
+        
+        # Get final loss from training history
+        train_history = trainer.state.log_history
+        final_loss = None
+        for entry in reversed(train_history):
+            if 'loss' in entry:
+                final_loss = entry['loss']
+                break
+        
+        # Prepare metrics dictionary
+        metrics = {
+            "experiment": experiment_name,
+            "num_gpus": world_size,
+            "zero_stage": zero_stage,
+            "strategy": f"deepspeed_zero{zero_stage}",
+            "training_time_hours": training_time / 3600,
+            "samples_per_second": (num_samples * args.num_train_epochs) / training_time,
+            "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
+            "final_loss": final_loss if final_loss is not None else 0.0,
+        }
+        
+        # Print and save metrics
+        print_metrics_summary(metrics)
+        save_training_metrics(metrics)
+        
+        # Final summary
+        print("\n" + "="*70)
+        print(f"{experiment_name.upper()} TRAINING COMPLETE!")
+        print("="*70)
+        print(f"\nTime: {training_time/3600:.2f} hours")
+        print(f"Throughput: {metrics['samples_per_second']:.1f} samples/sec")
+        print(f"Memory: {metrics['peak_memory_gb']:.2f} GB")
+        print(f"\nCheckpoints: {args.output_dir}")
+        print(f"Metrics: results/training_metrics.csv")
+        print("\nRun 'python scripts/compare_training.py' to see comparison")
+        print()
 
 
 if __name__ == "__main__":
