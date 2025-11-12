@@ -139,6 +139,7 @@ def main():
     
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+    print("LoRA applied")
     
     # Load dataset
     print("\n[4/5] Loading dataset...")
@@ -226,16 +227,15 @@ def main():
     trainer.save_model(final_dir)
     tokenizer.save_pretrained(final_dir)
     
-    print(f"\nModel saved to {final_dir}")
+    print(f"Model saved to {final_dir}")
     
-    # Collect Metrics
     print("\n" + "="*70)
     print("COLLECTING METRICS")
     print("="*70)
     
     num_samples = len(tokenized)
     
-    # Get final loss from training history
+    # Get final loss
     train_history = trainer.state.log_history
     final_loss = None
     for entry in reversed(train_history):
@@ -243,17 +243,15 @@ def main():
             final_loss = entry['loss']
             break
     
-    # Collect core metrics
     metrics = {
         "experiment": "baseline",
         "num_gpus": 1,
+        "zero_stage": 0,  # no DeepSpeed
         "strategy": "pytorch_lora",
         "training_time_hours": training_time / 3600,
         "samples_per_second": (num_samples * args.num_train_epochs) / training_time,
         "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
         "final_loss": final_loss if final_loss is not None else 0.0,
-        "speedup": 1.0,  # Baseline is 1.0x
-        "efficiency_percent": 100.0,  # Baseline is 100%
     }
     
     # Print and save metrics
