@@ -26,7 +26,7 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
-from training.utils import (
+from utils import (
     save_training_metrics,
     print_metrics_summary,
     create_experiment_name,
@@ -78,7 +78,7 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=16,
+        default=1,
         help="Gradient accumulation steps"
     )
     
@@ -100,7 +100,7 @@ def parse_args():
     parser.add_argument(
         "--deepspeed_config",
         type=str,
-        default="./training/ds_config_zero2.json",
+        default="./configs/ds_config_zero2.json",
         help="Path to DeepSpeed config file"
     )
     
@@ -121,6 +121,13 @@ def parse_args():
 
 
 def main():
+    
+    os.environ["DS_BUILD_OPS"] = "0"
+    os.environ["DS_BUILD_CPU_ADAM"] = "0"
+    os.environ["DS_BUILD_FUSED_ADAM"] = "0"
+    os.environ["DS_BUILD_UTILS"] = "0"
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0"
+
     """Main training function."""
     args = parse_args()
     
@@ -164,7 +171,7 @@ def main():
         if is_distributed:
             print(f"Distributed Training: {world_size} GPUs")
             for i in range(world_size):
-                print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+                print(f"  GPU {i}: {torch.cuda.get_device_name(0)}")
         else:
             print(f"Single GPU Training")
             print(f"  GPU: {torch.cuda.get_device_name(0)}")
@@ -214,6 +221,9 @@ def main():
     )
     
     model = get_peft_model(model, lora_config)
+    
+    model.enable_input_require_grads()
+    
     if is_main_process:
         model.print_trainable_parameters()
         print("LoRA applied")
@@ -260,7 +270,7 @@ def main():
         
         # Memory optimization (DeepSpeed will handle fp16)
         gradient_checkpointing=True,
-        
+        fp16=True,
         # Logging
         logging_steps=10,
         logging_dir=f"{args.output_dir}/logs",
