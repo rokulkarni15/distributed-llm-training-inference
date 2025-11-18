@@ -4,18 +4,19 @@ DeepSpeed ZeRO-2 training: PyTorch + LoRA + DeepSpeed ZeRO-2 on 1-4 GPUs.
 
 Usage:
     # Single GPU
-    python training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
+    deepspeed --num_gpus=1 training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
     
     # Multi-GPU (2, 3, or 4 GPUs)
-    torchrun --nproc_per_node=2 training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
-    torchrun --nproc_per_node=3 training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
-    torchrun --nproc_per_node=4 training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
+    deepspeed --num_gpus=2 training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
+    deepspeed --num_gpus=3 training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
+    deepspeed --num_gpus=4 training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
 """
 
 import os
 import argparse
 import time
 import torch
+import pandas as pd
 from datasets import load_from_disk
 from transformers import (
     AutoModelForCausalLM,
@@ -63,9 +64,16 @@ def parse_args():
     
     parser.add_argument(
         "--num_train_epochs",
+        type=float,
+        default=None,
+        help="Number of training epochs (if provided, overrides target_total_steps)"
+    )
+    
+    parser.add_argument(
+        "--target_total_steps",
         type=int,
-        default=3,
-        help="Number of training epochs"
+        default=10000,
+        help="Target total training steps (used to auto-calculate epochs if num_train_epochs is None)"
     )
     
     parser.add_argument(
@@ -96,11 +104,10 @@ def parse_args():
         help="LoRA rank"
     )
     
-    # DeepSpeed config argument
     parser.add_argument(
         "--deepspeed_config",
         type=str,
-        default="./configs/ds_config_zero2.json",
+        default="../configs/ds_config_zero2.json",
         help="Path to DeepSpeed config file"
     )
     
@@ -114,28 +121,76 @@ def parse_args():
         "--local_rank",
         type=int,
         default=-1,
-        help="Local rank for distributed training (automatically set by torchrun)"
+        help="Local rank for distributed training (automatically set by DeepSpeed)"
     )
     
     return parser.parse_args()
 
 
-def main():
+def load_cumulative_metrics(output_dir, metrics_csv_path, experiment_name):
+    """Load cumulative training time and steps from CSV for this experiment."""
+    cumulative_time = 0.0
+    cumulative_global_steps = 0
     
+    # Load from CSV if exists
+    if os.path.exists(metrics_csv_path):
+        try:
+            df = pd.read_csv(metrics_csv_path)
+            if not df.empty and 'experiment' in df.columns:
+                # Filter for this specific experiment
+                matching_rows = df[df['experiment'] == experiment_name]
+                if not matching_rows.empty:
+                    # Sum up all previous sessions for this experiment
+                    cumulative_time = matching_rows['training_time_hours'].sum()
+                    cumulative_global_steps = matching_rows['total_steps'].max()
+                    return cumulative_time, cumulative_global_steps
+        except Exception as e:
+            print(f"Warning: Could not load cumulative metrics from CSV: {e}")
+    
+    # Fallback: Try to load from last checkpoint
+    if os.path.exists(output_dir):
+        checkpoints = [d for d in os.listdir(output_dir) 
+                      if d.startswith("checkpoint-") and os.path.isdir(os.path.join(output_dir, d))]
+        if checkpoints:
+            latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("-")[1]))
+            checkpoint_step = int(latest_checkpoint.split("-")[1])
+            cumulative_global_steps = checkpoint_step
+            print(f"Loaded steps from checkpoint: {cumulative_global_steps}")
+    
+    return cumulative_time, cumulative_global_steps
+
+
+def calculate_epochs(args, num_samples, world_size):
+    """Calculate epochs based on target steps or provided epochs."""
+    if args.num_train_epochs is not None:
+        return args.num_train_epochs
+    
+    effective_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps * world_size
+    steps_per_epoch = num_samples / effective_batch_size
+    epochs = args.target_total_steps / steps_per_epoch
+    return epochs
+
+
+def main():
+    """Main training function."""
+    # Set environment variables BEFORE any CUDA operations
     os.environ["DS_BUILD_OPS"] = "0"
     os.environ["DS_BUILD_CPU_ADAM"] = "0"
-    os.environ["DS_BUILD_FUSED_ADAM"] = "0"
+    os.environ["DS_BUILD_FUSED_ADAM"] = "1"
     os.environ["DS_BUILD_UTILS"] = "0"
     os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0"
-
-    """Main training function."""
+    
     args = parse_args()
     
-    # Detect distributed setup
-    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    # Detect distributed setup - DeepSpeed sets these automatically
+    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_distributed = world_size > 1
     is_main_process = local_rank in [-1, 0]
+    
+    # Set CUDA device for this process
+    if local_rank != -1:
+        torch.cuda.set_device(local_rank)
     
     # Detect ZeRO stage and create experiment name
     zero_stage = get_zero_stage_from_config(args.deepspeed_config)
@@ -145,7 +200,13 @@ def main():
     if args.output_dir is None:
         args.output_dir = f"./checkpoints/{experiment_name}"
     
-    # Only print from main process
+    # Metrics CSV path
+    metrics_csv_path = "results/training_metrics.csv"
+    if is_main_process:
+        os.makedirs(os.path.dirname(metrics_csv_path), exist_ok=True)
+        os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Print info only from main process
     if is_main_process:
         print("\n" + "="*70)
         print(f"DEEPSPEED ZeRO-{zero_stage} TRAINING")
@@ -171,7 +232,7 @@ def main():
         if is_distributed:
             print(f"Distributed Training: {world_size} GPUs")
             for i in range(world_size):
-                print(f"  GPU {i}: {torch.cuda.get_device_name(0)}")
+                print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
         else:
             print(f"Single GPU Training")
             print(f"  GPU: {torch.cuda.get_device_name(0)}")
@@ -191,19 +252,11 @@ def main():
     if is_main_process:
         print("\n[2/5] Loading model...")
     
-    # For distributed training, load model differently
-    if is_distributed:
-        # Don't use device_map="auto" for multi-GPU, let DeepSpeed handle it
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            torch_dtype=torch.float16,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-        )
+    # DeepSpeed handles device placement, don't use device_map
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        torch_dtype=torch.float16,
+    )
     
     if is_main_process:
         print("Model loaded")
@@ -221,7 +274,6 @@ def main():
     )
     
     model = get_peft_model(model, lora_config)
-    
     model.enable_input_require_grads()
     
     if is_main_process:
@@ -251,8 +303,47 @@ def main():
         desc="Tokenizing" if is_main_process else None,
     )
     
+    num_samples = len(tokenized)
     if is_main_process:
-        print(f"Dataset ready: {len(tokenized):,} samples")
+        print(f"Dataset ready: {num_samples:,} samples")
+    
+    # Calculate epochs
+    calculated_epochs = calculate_epochs(args, num_samples, world_size)
+    if args.num_train_epochs is None:
+        args.num_train_epochs = calculated_epochs
+        if is_main_process:
+            print(f"Auto-calculated epochs: {calculated_epochs:.2f} (based on target_total_steps={args.target_total_steps})")
+    
+    effective_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps * world_size
+    steps_per_epoch = num_samples / effective_batch_size
+    total_expected_steps = int(args.num_train_epochs * steps_per_epoch)
+    if is_main_process:
+        print(f"Expected total steps: {total_expected_steps:,} (epochs={args.num_train_epochs:.2f} × {steps_per_epoch:.0f} steps/epoch)")
+    
+    # Load cumulative metrics if resuming (only on main process)
+    resume_checkpoint = None
+    cumulative_time_hours = 0.0
+    cumulative_global_steps = 0
+    
+    if is_main_process and args.resume_from_checkpoint:
+        if os.path.exists(args.output_dir):
+            checkpoints = [d for d in os.listdir(args.output_dir) 
+                          if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_dir, d))]
+            if checkpoints:
+                latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("-")[1]))
+                resume_checkpoint = os.path.join(args.output_dir, latest_checkpoint)
+                print(f"\n✓ Found checkpoint: {resume_checkpoint}")
+                
+                # Load cumulative metrics
+                cumulative_time_hours, cumulative_global_steps = load_cumulative_metrics(
+                    args.output_dir, metrics_csv_path, experiment_name
+                )
+                if cumulative_time_hours > 0 or cumulative_global_steps > 0:
+                    print(f"  Loaded cumulative: {cumulative_time_hours:.2f} hours, {cumulative_global_steps:,} steps")
+                
+                print("  Training will resume from this checkpoint")
+            else:
+                print("\n✓ No checkpoint found, starting fresh training")
     
     # Training setup with DeepSpeed
     if is_main_process:
@@ -268,20 +359,22 @@ def main():
         # DeepSpeed integration
         deepspeed=args.deepspeed_config,
         
-        # Memory optimization (DeepSpeed will handle fp16)
+        # Memory optimization
         gradient_checkpointing=True,
         fp16=True,
+        
         # Logging
         logging_steps=10,
         logging_dir=f"{args.output_dir}/logs",
         
-        # Saving - Save more frequently for cluster resilience
+        # Saving
         save_strategy="steps",
-        save_steps=100,  # Save every 100 steps
-        save_total_limit=3,  # Keep last 3 checkpoints
+        save_steps=100,
+        save_total_limit=3,
         
-        # Distributed training settings
+        # Distributed settings
         ddp_find_unused_parameters=False,
+        local_rank=local_rank,
         
         # Disable reporting
         report_to="none",
@@ -299,26 +392,14 @@ def main():
         data_collator=data_collator,
     )
     
-    # Check for existing checkpoint
-    resume_checkpoint = None
-    if args.resume_from_checkpoint and is_main_process:
-        if os.path.exists(args.output_dir):
-            checkpoints = [d for d in os.listdir(args.output_dir) 
-                          if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_dir, d))]
-            if checkpoints:
-                # Get the latest checkpoint
-                latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("-")[1]))
-                resume_checkpoint = os.path.join(args.output_dir, latest_checkpoint)
-                print(f"\n✓ Found checkpoint: {resume_checkpoint}")
-                print("  Training will resume from this checkpoint")
-            else:
-                print("\n✓ No checkpoint found, starting fresh training")
-    
     if is_main_process:
         print("✓ Trainer configured with DeepSpeed ZeRO-2")
-        total_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps * world_size
-        print(f"\nEffective batch size: {total_batch_size}")
+        print(f"\nEffective batch size: {effective_batch_size}")
         print(f"  = {args.per_device_train_batch_size} (per_device) × {args.gradient_accumulation_steps} (grad_accum) × {world_size} (GPUs)")
+        print(f"Target epochs: {args.num_train_epochs:.2f} ({total_expected_steps:,} total steps)")
+        if cumulative_global_steps > 0:
+            remaining_steps = total_expected_steps - cumulative_global_steps
+            print(f"Remaining steps: {remaining_steps:,} (from step {cumulative_global_steps:,})")
     
     # Train
     if is_main_process:
@@ -327,14 +408,21 @@ def main():
         print("="*70)
         print()
     
-    start_time = time.time()
+    session_start_time = time.time()
     
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     
-    training_time = time.time() - start_time
+    session_time = time.time() - session_start_time
+    
+    # Synchronize all processes before collecting metrics
+    if is_distributed:
+        torch.distributed.barrier()
     
     # Save and collect metrics (only main process)
     if is_main_process:
+        session_global_steps = trainer.state.global_step - cumulative_global_steps
+        total_global_steps = trainer.state.global_step
+        
         print("\n" + "="*70)
         print("SAVING MODEL")
         print("="*70)
@@ -350,8 +438,6 @@ def main():
         print("COLLECTING METRICS")
         print("="*70)
         
-        num_samples = len(tokenized)
-        
         # Get final loss from training history
         train_history = trainer.state.log_history
         final_loss = None
@@ -360,31 +446,50 @@ def main():
                 final_loss = entry['loss']
                 break
         
-        # Prepare metrics dictionary
+        # Session metrics
+        session_time_hours = session_time / 3600
+        total_time_hours = cumulative_time_hours + session_time_hours
+        session_samples = session_global_steps * effective_batch_size
+        total_samples_processed = total_global_steps * effective_batch_size
+        
+        # Get memory usage
+        peak_memory_gb = torch.cuda.max_memory_allocated() / 1e9
+        
+        # Prepare metrics dictionary for THIS SESSION
         metrics = {
             "experiment": experiment_name,
             "num_gpus": world_size,
             "zero_stage": zero_stage,
             "strategy": f"deepspeed_zero{zero_stage}",
-            "training_time_hours": training_time / 3600,
-            "samples_per_second": (num_samples * args.num_train_epochs) / training_time,
-            "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
+            "training_time_hours": session_time_hours,  # This session only
+            "total_steps": total_global_steps,  # Cumulative position
+            "samples_processed": session_samples,  # This session only
+            "samples_per_second": session_samples / session_time if session_time > 0 else 0,
+            "cumulative_time_hours": total_time_hours,  # Total across all sessions
+            "cumulative_samples_per_second": total_samples_processed / (total_time_hours * 3600) if total_time_hours > 0 else 0,
+            "peak_memory_gb": peak_memory_gb,
             "final_loss": final_loss if final_loss is not None else 0.0,
+            "target_epochs": args.num_train_epochs,
+            "actual_epochs": total_global_steps / steps_per_epoch,
         }
         
         # Print and save metrics
         print_metrics_summary(metrics)
-        save_training_metrics(metrics)
+        save_training_metrics(metrics, csv_path=metrics_csv_path)
         
         # Final summary
         print("\n" + "="*70)
         print(f"{experiment_name.upper()} TRAINING COMPLETE!")
         print("="*70)
-        print(f"\nTime: {training_time/3600:.2f} hours")
-        print(f"Throughput: {metrics['samples_per_second']:.1f} samples/sec")
+        print(f"\nSession time: {session_time_hours:.2f} hours")
+        print(f"Total cumulative time: {total_time_hours:.2f} hours")
+        print(f"Session throughput: {metrics['samples_per_second']:.1f} samples/sec")
+        print(f"Cumulative throughput: {metrics['cumulative_samples_per_second']:.1f} samples/sec")
         print(f"Memory: {metrics['peak_memory_gb']:.2f} GB")
+        print(f"Steps: {total_global_steps:,} / {total_expected_steps:,}")
+        print(f"Epochs: {metrics['actual_epochs']:.2f} / {metrics['target_epochs']:.2f}")
         print(f"\nCheckpoints: {args.output_dir}")
-        print(f"Metrics: results/training_metrics.csv")
+        print(f"Metrics: {metrics_csv_path}")
         print("\nRun 'python scripts/compare_training.py' to see comparison")
         print()
 
