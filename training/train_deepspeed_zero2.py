@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import json
 import argparse
 import time
 import torch
@@ -27,12 +28,106 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
-from utils import (
-    save_training_metrics,
-    print_metrics_summary,
-    create_experiment_name,
-    get_zero_stage_from_config
-)
+from torch.utils.data import DataLoader
+
+def get_dataloader(tokenized, batch_size, world_size):
+    return DataLoader(
+        tokenized,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,  # Parallel data loading
+        pin_memory=True,  # Faster GPU transfer
+        persistent_workers=True,  # Better multi-epoch performance
+    )
+
+
+def get_zero_stage_from_config(config_path):
+    """Extract ZeRO stage from DeepSpeed config file."""
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        return config.get('zero_optimization', {}).get('stage', 0)
+    except Exception as e:
+        print(f"Warning: Could not read ZeRO stage from config: {e}")
+        return 0
+
+
+def create_experiment_name(num_gpus, zero_stage):
+    """Create consistent experiment name."""
+    return f"zero{zero_stage}_{num_gpus}gpu"
+
+
+def print_metrics_summary(metrics):
+    """Print metrics in a formatted way."""
+    print("\n" + "="*70)
+    print("TRAINING METRICS SUMMARY")
+    print("="*70)
+    print(f"Experiment:              {metrics['experiment']}")
+    print(f"Strategy:                {metrics['strategy']}")
+    print(f"Number of GPUs:          {metrics['num_gpus']}")
+    print(f"ZeRO Stage:              {metrics['zero_stage']}")
+    print(f"Session Time:            {metrics['training_time_hours']:.4f} hours")
+    print(f"Cumulative Time:         {metrics['cumulative_time_hours']:.4f} hours")
+    print(f"Total Steps:             {metrics['total_steps']:,}")
+    print(f"Session Samples:         {metrics['samples_processed']:,}")
+    print(f"Session Throughput:      {metrics['samples_per_second']:.2f} samples/sec")
+    print(f"Cumulative Throughput:   {metrics['cumulative_samples_per_second']:.2f} samples/sec")
+    print(f"Peak Memory:             {metrics['peak_memory_gb']:.2f} GB")
+    print(f"Final Loss:              {metrics['final_loss']:.4f}")
+    print(f"Target Epochs:           {metrics['target_epochs']:.2f}")
+    print(f"Actual Epochs:           {metrics['actual_epochs']:.2f}")
+    print("="*70)
+
+
+def save_training_metrics(metrics, results_dir="results"):
+    """
+    Save metrics to separate CSV files for each configuration.
+    
+    File naming: results/zero{stage}_{num_gpus}gpu_metrics.csv
+    Example: results/zero2_1gpu_metrics.csv, results/zero2_2gpu_metrics.csv
+    """
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # Create filename based on experiment configuration
+    experiment_name = metrics['experiment']
+    csv_filename = f"{experiment_name}_metrics.csv"
+    csv_path = os.path.join(results_dir, csv_filename)
+    
+    # Create DataFrame from metrics
+    df_new = pd.DataFrame([metrics])
+    
+    # Append to existing CSV or create new one
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+        try:
+            df_existing = pd.read_csv(csv_path)
+            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+            df_combined.to_csv(csv_path, index=False)
+            print(f"\n✓ Metrics appended to: {csv_path}")
+        except (pd.errors.EmptyDataError, Exception) as e:
+            # If file is corrupted or empty, overwrite it
+            print(f"Warning: Could not read existing file ({e}), creating new file")
+            df_new.to_csv(csv_path, index=False)
+            print(f"✓ Metrics saved to: {csv_path}")
+    else:
+        df_new.to_csv(csv_path, index=False)
+        print(f"\n✓ Metrics saved to: {csv_path}")
+    
+    # Also save to a combined file for easy comparison
+    combined_csv_path = os.path.join(results_dir, "all_experiments_metrics.csv")
+    if os.path.exists(combined_csv_path) and os.path.getsize(combined_csv_path) > 0:
+        try:
+            df_all = pd.read_csv(combined_csv_path)
+            df_all = pd.concat([df_all, df_new], ignore_index=True)
+            df_all.to_csv(combined_csv_path, index=False)
+            print(f"✓ Metrics also appended to combined file: {combined_csv_path}")
+        except (pd.errors.EmptyDataError, Exception) as e:
+            # If file is corrupted or empty, overwrite it
+            print(f"Warning: Could not read combined file ({e}), creating new file")
+            df_new.to_csv(combined_csv_path, index=False)
+            print(f"✓ Metrics saved to combined file: {combined_csv_path}")
+    else:
+        df_new.to_csv(combined_csv_path, index=False)
+        print(f"✓ Metrics also saved to combined file: {combined_csv_path}")
 
 
 def parse_args():
@@ -79,14 +174,14 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=1,
+        default=4,
         help="Batch size per GPU"
     )
     
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
+        default=4,
         help="Gradient accumulation steps"
     )
     
@@ -127,24 +222,24 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_cumulative_metrics(output_dir, metrics_csv_path, experiment_name):
-    """Load cumulative training time and steps from CSV for this experiment."""
+def load_cumulative_metrics(output_dir, results_dir, experiment_name):
+    """Load cumulative training time and steps from the experiment-specific CSV file."""
     cumulative_time = 0.0
     cumulative_global_steps = 0
     
-    # Load from CSV if exists
-    if os.path.exists(metrics_csv_path):
+    # Load from experiment-specific CSV if exists
+    csv_filename = f"{experiment_name}_metrics.csv"
+    csv_path = os.path.join(results_dir, csv_filename)
+    
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
         try:
-            df = pd.read_csv(metrics_csv_path)
-            if not df.empty and 'experiment' in df.columns:
-                # Filter for this specific experiment
-                matching_rows = df[df['experiment'] == experiment_name]
-                if not matching_rows.empty:
-                    # Sum up all previous sessions for this experiment
-                    cumulative_time = matching_rows['training_time_hours'].sum()
-                    cumulative_global_steps = matching_rows['total_steps'].max()
-                    return cumulative_time, cumulative_global_steps
-        except Exception as e:
+            df = pd.read_csv(csv_path)
+            if not df.empty:
+                # Sum up all previous sessions for this experiment
+                cumulative_time = df['training_time_hours'].sum()
+                cumulative_global_steps = df['total_steps'].max()
+                return cumulative_time, cumulative_global_steps
+        except (pd.errors.EmptyDataError, Exception) as e:
             print(f"Warning: Could not load cumulative metrics from CSV: {e}")
     
     # Fallback: Try to load from last checkpoint
@@ -200,10 +295,10 @@ def main():
     if args.output_dir is None:
         args.output_dir = f"./checkpoints/{experiment_name}"
     
-    # Metrics CSV path
-    metrics_csv_path = "results/training_metrics.csv"
+    # Results directory for metrics
+    results_dir = "results"
     if is_main_process:
-        os.makedirs(os.path.dirname(metrics_csv_path), exist_ok=True)
+        os.makedirs(results_dir, exist_ok=True)
         os.makedirs(args.output_dir, exist_ok=True)
     
     # Print info only from main process
@@ -216,6 +311,7 @@ def main():
         print(f"ZeRO Stage: {zero_stage}")
         print(f"Config: {args.deepspeed_config}")
         print(f"Output: {args.output_dir}")
+        print(f"Metrics File: {results_dir}/{experiment_name}_metrics.csv")
         print()
         print(f"NOTE: Using DeepSpeed ZeRO-{zero_stage} for optimizer + gradient state partitioning")
         if is_distributed:
@@ -334,9 +430,9 @@ def main():
                 resume_checkpoint = os.path.join(args.output_dir, latest_checkpoint)
                 print(f"\n✓ Found checkpoint: {resume_checkpoint}")
                 
-                # Load cumulative metrics
+                # Load cumulative metrics from experiment-specific CSV
                 cumulative_time_hours, cumulative_global_steps = load_cumulative_metrics(
-                    args.output_dir, metrics_csv_path, experiment_name
+                    args.output_dir, results_dir, experiment_name
                 )
                 if cumulative_time_hours > 0 or cumulative_global_steps > 0:
                     print(f"  Loaded cumulative: {cumulative_time_hours:.2f} hours, {cumulative_global_steps:,} steps")
@@ -378,6 +474,20 @@ def main():
         
         # Disable reporting
         report_to="none",
+        
+        # Add these for better multi-GPU performance:
+        dataloader_pin_memory=True,
+        dataloader_num_workers=4,  # Important for data loading speed
+        ddp_timeout=1800000,  # 30 minutes timeout
+        
+        # Better logging for analysis:
+        logging_steps=5,  # More frequent logging
+        eval_steps=200,   # Add evaluation if you have validation set
+        evaluation_strategy="steps",  # Monitor performance
+        
+        # Better saving:
+        save_steps=500,
+        save_total_limit=2,
     )
     
     data_collator = DataCollatorForLanguageModeling(
@@ -475,7 +585,7 @@ def main():
         
         # Print and save metrics
         print_metrics_summary(metrics)
-        save_training_metrics(metrics, csv_path=metrics_csv_path)
+        save_training_metrics(metrics, results_dir=results_dir)
         
         # Final summary
         print("\n" + "="*70)
@@ -489,8 +599,9 @@ def main():
         print(f"Steps: {total_global_steps:,} / {total_expected_steps:,}")
         print(f"Epochs: {metrics['actual_epochs']:.2f} / {metrics['target_epochs']:.2f}")
         print(f"\nCheckpoints: {args.output_dir}")
-        print(f"Metrics: {metrics_csv_path}")
-        print("\nRun 'python scripts/compare_training.py' to see comparison")
+        print(f"Metrics saved to:")
+        print(f"  - {results_dir}/{experiment_name}_metrics.csv (experiment-specific)")
+        print(f"  - {results_dir}/all_experiments_metrics.csv (combined)")
         print()
 
 
