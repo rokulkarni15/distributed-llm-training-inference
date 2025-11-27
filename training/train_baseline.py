@@ -21,7 +21,7 @@ from transformers import (
     DataCollatorForLanguageModeling,
 )
 from peft import LoraConfig, get_peft_model, TaskType
-from training.utils import save_training_metrics, print_metrics_summary
+from utils import save_training_metrics, print_metrics_summary
 
 
 def parse_args():
@@ -140,6 +140,16 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     print("LoRA applied")
+    for name, param in model.named_parameters():
+        if 'lora' in name:
+            param.requires_grad = True
+
+    # Verify trainable params
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable parameters: {trainable:,}")
+    
+    if trainable == 0:
+        raise RuntimeError("No trainable parameters! LoRA not applied correctly.")
     
     # Load dataset
     print("\n[4/5] Loading dataset...")
@@ -178,7 +188,7 @@ def main():
         
         # Memory optimization
         fp16=True,
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
         
         # Logging
         logging_steps=10,
