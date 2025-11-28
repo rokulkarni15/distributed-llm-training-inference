@@ -67,6 +67,13 @@ def parse_args():
     )
     
     parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=-1,
+        help="Maximum training steps (overrides num_train_epochs if set)"
+    )
+    
+    parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
         default=2,
@@ -106,6 +113,13 @@ def parse_args():
         type=int,
         default=-1,
         help="Local rank for distributed training"
+    )
+    
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from"
     )
     
     return parser.parse_args()
@@ -170,8 +184,29 @@ def main():
         print("Model loaded")
     
     # Apply LoRA
+    # if args.local_rank <= 0:
+    #     print(f"[3/5] Applying LoRA (r={args.lora_r})...")
+    # Apply LoRA
     if args.local_rank <= 0:
         print(f"[3/5] Applying LoRA (r={args.lora_r})...")
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_r,
+        lora_alpha=args.lora_r * 2,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        bias="none",
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    # Enable gradient checkpointing for LoRA
+    model.enable_input_require_grads()
+
+    if args.local_rank <= 0:
+        model.print_trainable_parameters()
+        print("LoRA applied")
     
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -220,22 +255,27 @@ def main():
     # Training setup
     if args.local_rank <= 0:
         print("[5/5] Configuring training with DeepSpeed ZeRO-2...")
-    
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         # Optimization
         fp16=True,
         gradient_checkpointing=True,
+        lr_scheduler_type="constant",
         # Logging
         logging_steps=10,
         logging_dir=f"{args.output_dir}/logs",
         # Saving
-        save_strategy="epoch",
+        save_strategy="steps" if args.max_steps > 0 else "epoch",
+        save_steps=500 if args.max_steps > 0 else None,
         save_total_limit=2,
+        # Resume
+        resume_from_checkpoint=args.resume_from_checkpoint,
         # DeepSpeed
         deepspeed=args.deepspeed,
         # Distributed
@@ -261,16 +301,19 @@ def main():
         print(f"Effective batch size: {effective_bs}")
     
     # Train
+    # Train
     if args.local_rank <= 0:
         print("\n" + "="*70)
         print(f"STARTING TRAINING: {experiment_name.upper()}")
+        if args.resume_from_checkpoint:
+            print(f"RESUMING FROM: {args.resume_from_checkpoint}")
         print("="*70)
         print()
-    
+
     start_time = time.time()
-    
-    trainer.train()
-    
+
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+
     training_time = time.time() - start_time
     
     # Save and collect metrics
