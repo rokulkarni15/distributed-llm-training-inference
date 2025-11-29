@@ -123,6 +123,42 @@ def parse_args():
     
     return parser.parse_args()
 
+def save_checkpoint_metrics(metrics, file_path="results/checkpoint_metrics.csv"):  
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    
+    file_exists = os.path.isfile(file_path)
+    
+    with open(file_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=metrics.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(metrics)
+
+class SaveMetricsOnCheckpoint(TrainerCallback):
+ 
+    def __init__(self):
+        self.start_time = time.time()
+ 
+    def on_save(self, args, state, control, **kwargs):
+        # Time since training started
+        elapsed_seconds = time.time() - self.start_time
+        self.start_time = time.time()
+        
+        # Safe extraction of last log entry
+        recent_logs = state.log_history[-100:]
+        last_log = next((log for log in reversed(recent_logs) if "loss" in log), {})
+        
+        metrics = {
+            "global_step": state.global_step,
+            "training_time_hours": elapsed_seconds / 3600,
+            "loss": last_log.get("loss"),
+            "learning_rate": last_log.get("learning_rate"),
+            "epoch": state.epoch,
+            "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0,
+        }
+        
+        save_checkpoint_metrics(metrics)
+        torch.cuda.empty_cache()
 
 def main():
     """Main training function."""
@@ -278,6 +314,7 @@ def main():
         args=training_args,
         train_dataset=tokenized,
         data_collator=data_collator,
+        callbacks=[SaveMetricsOnCheckpoint()]
     )
     
     if args.local_rank <= 0:
