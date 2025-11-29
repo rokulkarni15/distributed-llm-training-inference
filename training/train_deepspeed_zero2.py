@@ -227,21 +227,10 @@ def main():
     if args.local_rank <= 0:
         print("Model loaded")
     
-    # Apply LoRA
-    # if args.local_rank <= 0:
-    #     print(f"[3/5] Applying LoRA (r={args.lora_r})...")
-    # Apply LoRA
     if args.local_rank <= 0:
         print(f"[3/5] Applying LoRA (r={args.lora_r})...")
 
-    # lora_config = LoraConfig(
-    #     task_type=TaskType.CAUSAL_LM,
-    #     r=args.lora_r,
-    #     lora_alpha=args.lora_r * 2,
-    #     lora_dropout=0.05,
-    #     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    #     bias="none",
-    # )
+   
     lora_config = LoraConfig(
         r=args.lora_r,                           # From command line (32)
         lora_alpha=args.lora_r * 2,              # HARD-CODED: 2x rank = 64
@@ -262,23 +251,6 @@ def main():
     # Enable gradient checkpointing for LoRA
     model.enable_input_require_grads()
 
-    if args.local_rank <= 0:
-        model.print_trainable_parameters()
-        print("LoRA applied")
-    
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_r,
-        lora_alpha=args.lora_r * 2,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        bias="none",
-    )
-    
-    model = get_peft_model(model, lora_config)
-    
-    model.enable_input_require_grads()
-    
     if args.local_rank <= 0:
         model.print_trainable_parameters()
         print("LoRA applied")
@@ -351,8 +323,8 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         
         learning_rate=args.learning_rate,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.03,  # Reduced from 0.05 for faster warmup
+        lr_scheduler_type="constant",
+        warmup_ratio=0.01,  # Reduced from 0.05 for faster warmup
         
         optim="adamw_torch",
         weight_decay=0.01,
