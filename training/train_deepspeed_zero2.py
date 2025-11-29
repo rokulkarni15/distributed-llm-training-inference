@@ -14,6 +14,7 @@ import os
 import argparse
 import time
 import torch
+import csv
 from datasets import load_from_disk
 from transformers import (
     AutoModelForCausalLM,
@@ -21,7 +22,9 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
+    TrainerCallback
 )
+
 from peft import LoraConfig, get_peft_model, TaskType
 
 from utils import (
@@ -125,8 +128,48 @@ def parse_args():
     return parser.parse_args()
 
 
+def save_checkpoint_metrics(metrics, file_path=f"results/checkpoint_metrics{parse_args().local_rank}.csv"):
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    
+    file_exists = os.path.isfile(file_path)
+    
+    with open(file_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=metrics.keys())
+        
+        # Write header if file didn't exist
+        if not file_exists:
+            writer.writeheader()
+        
+        writer.writerow(metrics)
+        
+        
+class SaveMetricsOnCheckpoint(TrainerCallback):
+
+    def __init__(self):
+        self.start_time = time.time()
+
+    def on_save(self, args, state, control, **kwargs):
+        # Time since training started
+        elapsed_seconds = time.time() - self.start_time
+        
+        # Safe extraction of last log entry
+        last_log = state.log_history[-1] if len(state.log_history) > 0 else {}
+        
+        metrics = {
+            "global_step": state.global_step,
+            "training_time_hours": elapsed_seconds / 3600,
+            "loss": last_log.get("loss"),
+            "learning_rate": last_log.get("learning_rate"),
+            "epoch": state.epoch,
+            "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
+        }
+        
+        save_checkpoint_metrics(metrics)
+        
 def main():
     """Main training function."""
+    
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parse_args()
     
     # Detect GPU count and ZeRO stage
@@ -179,6 +222,7 @@ def main():
         args.model_name,
         torch_dtype=torch.float16,
     )
+    torch.cuda.empty_cache()
     
     if args.local_rank <= 0:
         print("Model loaded")
@@ -190,13 +234,27 @@ def main():
     if args.local_rank <= 0:
         print(f"[3/5] Applying LoRA (r={args.lora_r})...")
 
+    # lora_config = LoraConfig(
+    #     task_type=TaskType.CAUSAL_LM,
+    #     r=args.lora_r,
+    #     lora_alpha=args.lora_r * 2,
+    #     lora_dropout=0.05,
+    #     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    #     bias="none",
+    # )
     lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_r,
-        lora_alpha=args.lora_r * 2,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        r=args.lora_r,                           # From command line (32)
+        lora_alpha=args.lora_r * 2,              # HARD-CODED: 2x rank = 64
+        lora_dropout=0.05,                       # HARD-CODED: slight dropout
+        
+        # HARD-CODED: Target ALL attention + MLP modules
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",      # Attention
+            "gate_proj", "up_proj", "down_proj"          # MLP layers
+        ],
+        
         bias="none",
+        task_type="CAUSAL_LM"
     )
 
     model = get_peft_model(model, lora_config)
@@ -228,59 +286,107 @@ def main():
     # Load dataset
     if args.local_rank <= 0:
         print("[4/5] Loading dataset...")
-    
+
     if not os.path.exists(args.dataset_path):
         raise FileNotFoundError(f"Dataset not found: {args.dataset_path}")
-    
+
     dataset = load_from_disk(args.dataset_path)
-    
+
+    if isinstance(dataset, dict) or hasattr(dataset, 'keys'):
+        if "validation" not in dataset:
+            print("Splitting train set into train/validation...")
+            split_dataset = dataset["train"].train_test_split(test_size=0.05, seed=42)
+            train_dataset = split_dataset["train"]
+            eval_dataset = split_dataset["test"]
+        else:
+            train_dataset = dataset["train"]
+            eval_dataset = dataset["validation"]
+    else:
+        print("Splitting dataset into train/validation...")
+        split_dataset = dataset.train_test_split(test_size=0.05, seed=42)
+        train_dataset = split_dataset["train"]
+        eval_dataset = split_dataset["test"]
+
+    print(f"Train samples: {len(train_dataset):,}")
+    print(f"Validation samples: {len(eval_dataset):,}")
+
     def tokenize(examples):
         return tokenizer(
             examples["text"],
             truncation=True,
             max_length=512,
-            padding=False,
+            padding=False,  # Don't pad during tokenization, let the data collator handle padding
         )
-    
-    tokenized = dataset.map(
+
+    # Tokenize the train and evaluation datasets separately
+    if args.local_rank <= 0:
+        print("Tokenizing train dataset...")
+    train_dataset = train_dataset.map(
         tokenize,
         batched=True,
-        remove_columns=dataset.column_names,
-        desc="Tokenizing" if args.local_rank <= 0 else None,
+        remove_columns=train_dataset.column_names,
+        desc="Tokenizing train dataset"
     )
-    
-    if args.local_rank <= 0:
-        print(f"Dataset ready: {len(tokenized):,} samples")
-    
-    # Training setup
-    if args.local_rank <= 0:
-        print("[5/5] Configuring training with DeepSpeed ZeRO-2...")
 
+    if args.local_rank <= 0:
+        print("Tokenizing evaluation dataset...")
+    eval_dataset = eval_dataset.map(
+        tokenize,
+        batched=True,
+        remove_columns=eval_dataset.column_names,
+        desc="Tokenizing evaluation dataset"
+    )
+
+    if args.local_rank <= 0:
+        print(f"Tokenized datasets ready:")
+        print(f"Train samples: {len(train_dataset):,}")
+        print(f"Validation samples: {len(eval_dataset):,}")
     training_args = TrainingArguments(
         output_dir=args.output_dir,
+        
         num_train_epochs=args.num_train_epochs,
-        max_steps=args.max_steps,
+        max_steps=args.max_steps if args.max_steps > 0 else -1,
+        
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        
         learning_rate=args.learning_rate,
-        # Optimization
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,  # Reduced from 0.05 for faster warmup
+        
+        optim="adamw_torch",
+        weight_decay=0.01,
+        max_grad_norm=1.0,
+        
         fp16=True,
         gradient_checkpointing=True,
-        lr_scheduler_type="constant",
-        # Logging
-        logging_steps=10,
-        logging_dir=f"{args.output_dir}/logs",
-        # Saving
-        save_strategy="steps" if args.max_steps > 0 else "epoch",
-        save_steps=500 if args.max_steps > 0 else None,
-        save_total_limit=2,
-        # Resume
-        resume_from_checkpoint=args.resume_from_checkpoint,
-        # DeepSpeed
-        deepspeed=args.deepspeed,
-        # Distributed
-        local_rank=args.local_rank,
+        
+        # Critical changes for stability
+        eval_strategy="steps",
+        eval_steps=500,  # More frequent evaluation to monitor progress
+        per_device_eval_batch_size=4,
+        
+        logging_steps=25,  # More frequent logging to monitor progress
+        logging_first_step=True,
+        
+        save_strategy="steps",
+        save_steps=500,  # More frequent saves
+        save_total_limit=3,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        
+        # Key changes to prevent hanging
+        dataloader_num_workers=0,  # Disable multiprocessing to avoid tokenizer fork issues
+        dataloader_pin_memory=True,
+        remove_unused_columns=False,
+        
+        # Additional stability settings
+        dataloader_drop_last=True,  # Avoid partial batches that can cause issues
+        disable_tqdm=False,  # Keep progress bars
+        
         report_to="none",
+        local_rank=args.local_rank,
+        seed=42,
     )
     
     data_collator = DataCollatorForLanguageModeling(
@@ -288,11 +394,15 @@ def main():
         mlm=False,
     )
     
+   
+    
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,      # ADDED THIS for evaluation
         data_collator=data_collator,
+        callbacks=[SaveMetricsOnCheckpoint()]
     )
     
     if args.local_rank <= 0:
@@ -333,7 +443,7 @@ def main():
         print("COLLECTING METRICS")
         print("="*70)
         
-        num_samples = len(tokenized)
+        num_samples = len(train_dataset)
         
         # Get final loss
         train_history = trainer.state.log_history
@@ -357,7 +467,7 @@ def main():
         
         # Print and save
         print_metrics_summary(metrics)
-        save_training_metrics(metrics)
+        save_training_metrics(metrics, csv_path=f"results/training_metrics_gpu{args.local_rank}.csv")
         
         # Final summary
         print("\n" + "="*70)
