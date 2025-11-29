@@ -12,6 +12,7 @@ import os
 import argparse
 import time
 import torch
+import csv  # Added
 from datasets import load_from_disk
 from transformers import (
     AutoModelForCausalLM,
@@ -19,6 +20,7 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
+    TrainerCallback  # Added
 )
 from peft import LoraConfig, get_peft_model, TaskType
 from training.utils import save_training_metrics, print_metrics_summary
@@ -59,6 +61,13 @@ def parse_args():
     )
     
     parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=-1,
+        help="Maximum training steps (overrides num_train_epochs if set)"
+    )
+    
+    parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
         default=1,  # Small batch size due to memory constraints
@@ -86,8 +95,52 @@ def parse_args():
         help="LoRA rank"
     )
     
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from"
+    )
+    
     return parser.parse_args()
 
+def save_checkpoint_metrics(metrics, file_path="results/checkpoint_metrics.csv"):  
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    
+    file_exists = os.path.isfile(file_path)
+    
+    with open(file_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=metrics.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(metrics)
+        
+        
+class SaveMetricsOnCheckpoint(TrainerCallback):
+
+    def __init__(self):
+        self.start_time = time.time()
+
+    def on_save(self, args, state, control, **kwargs):
+        # Time since training started
+        elapsed_seconds = time.time() - self.start_time
+        self.start_time = time.time()
+        
+        # Safe extraction of last log entry
+        recent_logs = state.log_history[-100:]
+        last_log = next((log for log in reversed(recent_logs) if "loss" in log), {})
+        
+        metrics = {
+            "global_step": state.global_step,
+            "training_time_hours": elapsed_seconds / 3600,
+            "loss": last_log.get("loss"),
+            "learning_rate": last_log.get("learning_rate"),
+            "epoch": state.epoch,
+            "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0,
+        }
+        
+        save_checkpoint_metrics(metrics)
+        torch.cuda.empty_cache()
 
 def main():
     """Main training function."""
@@ -102,7 +155,7 @@ def main():
     
     # Check GPU
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA required")
+        raise RuntimeError("CUDA required")  # Or handle CPU fallback if desired
     
     if torch.cuda.device_count() > 1:
         print("WARNING: Multiple GPUs detected but baseline uses only 1 GPU")
@@ -122,22 +175,30 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.float16,
-        device_map="auto",
+        device_map={"": 0},  # Force single GPU
     )
+    torch.cuda.empty_cache()  # Added to free memory
     print("Model loaded")
     
     # Apply LoRA
     print(f"\n[3/5] Applying LoRA (r={args.lora_r})...")
     lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
         r=args.lora_r,
         lora_alpha=args.lora_r * 2,
         lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj"
+        ],
         bias="none",
+        task_type="CAUSAL_LM"
     )
     
     model = get_peft_model(model, lora_config)
+    model.enable_input_require_grads()
+    model.gradient_checkpointing_enable()
+    torch.cuda.empty_cache()
+    
     model.print_trainable_parameters()
     print("LoRA applied")
     
@@ -147,8 +208,25 @@ def main():
         raise FileNotFoundError(f"Dataset not found: {args.dataset_path}")
     
     dataset = load_from_disk(args.dataset_path)
-    print(f"Loaded {len(dataset):,} samples")
     
+    if isinstance(dataset, dict) or hasattr(dataset, 'keys'):
+        if "validation" not in dataset:
+            print("Splitting train set into train/validation...")
+            split_dataset = dataset["train"].train_test_split(test_size=0.05, seed=42)
+            train_dataset = split_dataset["train"]
+            eval_dataset = split_dataset["test"]
+        else:
+            train_dataset = dataset["train"]
+            eval_dataset = dataset["validation"]
+    else:
+        print("Splitting dataset into train/validation...")
+        split_dataset = dataset.train_test_split(test_size=0.05, seed=42)
+        train_dataset = split_dataset["train"]
+        eval_dataset = split_dataset["test"]
+
+    print(f"Train samples: {len(train_dataset):,}")
+    print(f"Validation samples: {len(eval_dataset):,}")
+
     def tokenize(examples):
         return tokenizer(
             examples["text"],
@@ -156,40 +234,80 @@ def main():
             max_length=512,
             padding=False,
         )
-    
-    tokenized = dataset.map(
+
+    print("Tokenizing train dataset...")
+    train_dataset = train_dataset.map(
         tokenize,
         batched=True,
-        remove_columns=dataset.column_names,
-        desc="Tokenizing"
+        batch_size=1000,  # Process in batches
+        num_proc=4,  # Parallel processing
+        remove_columns=train_dataset.column_names,
+        load_from_cache_file=True,
+        desc="Tokenizing train dataset"
     )
-    
-    print(f"Dataset ready: {len(tokenized):,} samples")
+
+    print("Tokenizing evaluation dataset...")
+    eval_dataset = eval_dataset.map(
+        tokenize,
+        batched=True,
+        batch_size=1000,  # Add this
+        num_proc=4,  # Add this
+        load_from_cache_file=True,
+        remove_columns=eval_dataset.column_names,
+        desc="Tokenizing evaluation dataset"
+    )
+
+    print(f"Tokenized datasets ready:")
+    print(f"Train samples: {len(train_dataset):,}")
+    print(f"Validation samples: {len(eval_dataset):,}")
     
     # Training setup
     print("\n[5/5] Configuring training...")
+    eval_batch_size = min(4, len(eval_dataset))
     
     training_args = TrainingArguments(
         output_dir=args.output_dir,
+        
         num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps if args.max_steps > 0 else -1,
+        
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
         
-        # Memory optimization
+        learning_rate=args.learning_rate,
+        lr_scheduler_type="constant",
+        warmup_ratio=0.01,
+        
+        optim="adamw_torch",
+        weight_decay=0.01,
+        max_grad_norm=1.0,
+        
         fp16=True,
         gradient_checkpointing=True,
         
-        # Logging
-        logging_steps=10,
-        logging_dir=f"{args.output_dir}/logs",
+        save_strategy="steps",
+        save_steps=500,
+        save_total_limit=3,
+
+        eval_strategy="steps",
+        eval_steps=1000,
+        per_device_eval_batch_size=eval_batch_size,
         
-        # Saving
-        save_strategy="epoch",
-        save_total_limit=2,
+        logging_steps=25,
+        logging_first_step=True,
         
-        # Disable reporting
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        
+        dataloader_num_workers=0,
+        dataloader_pin_memory=True,
+        remove_unused_columns=False,
+        
+        dataloader_drop_last=True,
+        disable_tqdm=False,
+        
         report_to="none",
+        seed=42,
     )
     
     data_collator = DataCollatorForLanguageModeling(
@@ -200,21 +318,26 @@ def main():
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
+        callbacks=[SaveMetricsOnCheckpoint()]
     )
     
     print("Trainer ready")
-    print(f"Effective batch size: {args.per_device_train_batch_size * args.gradient_accumulation_steps}")
+    effective_bs = args.per_device_train_batch_size * args.gradient_accumulation_steps
+    print(f"Effective batch size: {effective_bs}")
     
     # Train
     print("\n" + "="*70)
     print("STARTING BASELINE TRAINING")
+    if args.resume_from_checkpoint:
+        print(f"RESUMING FROM: {args.resume_from_checkpoint}")
     print("="*70)
     
     start_time = time.time()
     
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     
     training_time = time.time() - start_time
     
@@ -233,7 +356,7 @@ def main():
     print("COLLECTING METRICS")
     print("="*70)
     
-    num_samples = len(tokenized)
+    num_samples = len(train_dataset)
     
     # Get final loss
     train_history = trainer.state.log_history
@@ -272,4 +395,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
