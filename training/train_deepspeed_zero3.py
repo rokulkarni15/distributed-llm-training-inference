@@ -24,7 +24,7 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
-from training.utils import (
+from utils import (
     save_training_metrics,
     print_metrics_summary,
     create_experiment_name,
@@ -107,6 +107,19 @@ def parse_args():
         default=-1,
         help="Local rank for distributed training"
     )
+
+    parser.add_argument(
+        "--quick_test",
+        action="store_true",
+        help="Run quick test with small subset (for testing pipeline)"
+    )
+
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=None,
+        help="Save checkpoint every N steps (in addition to epochs)"
+    )
     
     return parser.parse_args()
 
@@ -165,6 +178,8 @@ def main():
         args.model_name,
         torch_dtype=torch.float16,
     )
+
+    model.config.use_cache = False
     
     if args.local_rank <= 0:
         print("Model loaded")
@@ -196,6 +211,17 @@ def main():
         raise FileNotFoundError(f"Dataset not found: {args.dataset_path}")
     
     dataset = load_from_disk(args.dataset_path)
+
+    if args.quick_test:
+        print("\n" + "="*70)
+        print("QUICK TEST MODE ENABLED")
+        print("="*70)
+        print("Using 100 samples, 1 epoch for pipeline validation")
+        dataset = dataset.select(range(100))
+        args.num_train_epochs = 1
+        print(f"✓ Dataset: {len(dataset)} samples")
+        print(f"✓ Epochs: {args.num_train_epochs}")
+        print()
     
     def tokenize(examples):
         return tokenizer(
@@ -227,12 +253,13 @@ def main():
         learning_rate=args.learning_rate,
         # Optimization
         fp16=True,
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
         # Logging
         logging_steps=10,
         logging_dir=f"{args.output_dir}/logs",
-        # Saving
-        save_strategy="epoch",
+        # Saving - more frequent if quick test
+        save_strategy="steps" if args.save_steps else "epoch",
+        save_steps=args.save_steps if args.save_steps else 500,
         save_total_limit=2,
         # DeepSpeed
         deepspeed=args.deepspeed,
