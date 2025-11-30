@@ -21,7 +21,9 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
+    TrainerCallback
 )
+import csv
 from peft import LoraConfig, get_peft_model, TaskType
 
 from utils import (
@@ -41,7 +43,7 @@ def parse_args():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="meta-llama/Llama-2-7b-hf",
+        default="meta-llama/Llama-2-13b-hf",
         help="Base model"
     )
     
@@ -138,6 +140,27 @@ class SaveMetricsOnCheckpoint(TrainerCallback):
  
     def __init__(self):
         self.start_time = time.time()
+        self.first_step = True
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        # Run diagnostics on first step only
+        if self.first_step and args.local_rank <= 0:
+            self.first_step = False
+            print("\n" + "="*70)
+            print("DEEPSPEED DIAGNOSTIC (After Initialization)")
+            print("="*70)
+
+            # Now trainer.model.optimizer should exist
+            if hasattr(kwargs.get('model'), 'optimizer'):
+                print("✓ DeepSpeed optimizer detected")
+
+            allocated = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            print(f"  GPU Memory allocated: {allocated:.2f} GB")
+            print(f"  GPU Memory reserved: {reserved:.2f} GB")
+            print("="*70 + "\n")
+
+        return control
  
     def on_save(self, args, state, control, **kwargs):
         # Time since training started
@@ -169,7 +192,6 @@ def main():
     zero_stage = get_zero_stage_from_config(args.deepspeed)
     experiment_name = create_experiment_name(num_gpus, zero_stage)
     
-    # Set output directory based on experiment
     if args.output_dir is None:
         args.output_dir = f"./checkpoints/{experiment_name}"
     
@@ -180,18 +202,8 @@ def main():
         print("="*70)
         print(f"\nExperiment: {experiment_name}")
         print(f"GPUs: {num_gpus}")
-        print(f"ZeRO Stage: {zero_stage}")
-        print(f"Config: {args.deepspeed}")
-        print(f"Output: {args.output_dir}")
-        print()
-        
-        if num_gpus == 1:
-            print("NOTE: Running on 1 GPU with CPU offloading for memory efficiency")
-        else:
-            print(f"NOTE: Running on {num_gpus} GPUs with parameter sharding + CPU offloading")
-        print()
+        print(f"Output: {args.output_dir}\n")
     
-    # Check CUDA
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
     
@@ -203,24 +215,16 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    if args.local_rank <= 0:
-        print("Tokenizer loaded")
-    
-    # Load model
+    # Load model - NO device_map with DeepSpeed!
     if args.local_rank <= 0:
         print("[2/5] Loading model...")
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.float16,
+        use_cache=False
     )
-
-    model.config.use_cache = False
     
-    if args.local_rank <= 0:
-        print("Model loaded")
-    
-    # Apply LoRA
     if args.local_rank <= 0:
         print(f"[3/5] Applying LoRA (r={args.lora_r})...")
     
@@ -235,9 +239,11 @@ def main():
     
     model = get_peft_model(model, lora_config)
     
+    # Enable input gradients for LoRA
+    model.enable_input_require_grads()
+    
     if args.local_rank <= 0:
         model.print_trainable_parameters()
-        print("LoRA applied")
     
     # Load dataset
     if args.local_rank <= 0:
@@ -247,17 +253,11 @@ def main():
         raise FileNotFoundError(f"Dataset not found: {args.dataset_path}")
     
     dataset = load_from_disk(args.dataset_path)
-
+    
     if args.quick_test:
-        print("\n" + "="*70)
-        print("QUICK TEST MODE ENABLED")
-        print("="*70)
-        print("Using 100 samples, 1 epoch for pipeline validation")
+        print("\nQUICK TEST MODE: 100 samples, 1 epoch\n")
         dataset = dataset.select(range(100))
         args.num_train_epochs = 1
-        print(f"✓ Dataset: {len(dataset)} samples")
-        print(f"✓ Epochs: {args.num_train_epochs}")
-        print()
     
     def tokenize(examples):
         return tokenizer(
@@ -276,10 +276,9 @@ def main():
     
     if args.local_rank <= 0:
         print(f"Dataset ready: {len(tokenized):,} samples")
-    
-    # Training setup
-    if args.local_rank <= 0:
         print("[5/5] Configuring training with DeepSpeed ZeRO-3...")
+
+    deepspeed_config = os.path.abspath(args.deepspeed)
     
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -289,16 +288,19 @@ def main():
         learning_rate=args.learning_rate,
         # Optimization
         fp16=True,
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": True},  # Important for ZeRO-3!
         # Logging
         logging_steps=10,
         logging_dir=f"{args.output_dir}/logs",
-        # Saving - more frequent if quick test
+        # Saving
         save_strategy="steps" if args.save_steps else "epoch",
         save_steps=args.save_steps if args.save_steps else 500,
         save_total_limit=2,
         # DeepSpeed
-        deepspeed=args.deepspeed,
+        deepspeed=deepspeed_config,
+        # Important for DeepSpeed ZeRO-3 with LoRA
+        ddp_find_unused_parameters=False,
         # Distributed
         local_rank=args.local_rank,
         report_to="none",
@@ -318,51 +320,27 @@ def main():
     )
     
     if args.local_rank <= 0:
-        print("✓ Trainer configured")
         effective_bs = args.per_device_train_batch_size * args.gradient_accumulation_steps * num_gpus
-        print(f"Effective batch size: {effective_bs}")
-    
-    # Train
-    if args.local_rank <= 0:
-        print("\n" + "="*70)
-        print(f"STARTING TRAINING: {experiment_name.upper()}")
+        print(f"✓ Effective batch size: {effective_bs}\n")
         print("="*70)
-        print()
+        print("STARTING TRAINING")
+        print("="*70 + "\n")
     
     start_time = time.time()
-    
     trainer.train()
-    
     training_time = time.time() - start_time
     
-    # Save and collect metrics
+    # Save model
     if args.local_rank <= 0:
-        print("\n" + "="*70)
-        print("SAVING MODEL")
-        print("="*70)
-        
         final_dir = f"{args.output_dir}/final"
         trainer.save_model(final_dir)
         tokenizer.save_pretrained(final_dir)
         
-        print(f"✓ Model saved to {final_dir}")
-        
-        # Collect metrics
-        print("\n" + "="*70)
-        print("COLLECTING METRICS")
-        print("="*70)
-        
+        # Collect and save metrics
         num_samples = len(tokenized)
-        
-        # Get final loss
         train_history = trainer.state.log_history
-        final_loss = None
-        for entry in reversed(train_history):
-            if 'loss' in entry:
-                final_loss = entry['loss']
-                break
+        final_loss = next((entry['loss'] for entry in reversed(train_history) if 'loss' in entry), None)
         
-        # Metrics
         metrics = {
             "experiment": experiment_name,
             "num_gpus": num_gpus,
@@ -371,24 +349,14 @@ def main():
             "training_time_hours": training_time / 3600,
             "samples_per_second": (num_samples * args.num_train_epochs) / training_time,
             "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
-            "final_loss": final_loss if final_loss is not None else 0.0,
+            "final_loss": final_loss or 0.0,
         }
         
-        # Print and save
         print_metrics_summary(metrics)
         save_training_metrics(metrics)
         
-        # Final summary
-        print("\n" + "="*70)
-        print(f"{experiment_name.upper()} TRAINING COMPLETE!")
-        print("="*70)
-        print(f"\nTime: {training_time/3600:.2f} hours")
-        print(f"Throughput: {metrics['samples_per_second']:.1f} samples/sec")
-        print(f"Memory: {metrics['peak_memory_gb']:.2f} GB")
-        print(f"\nCheckpoints: {args.output_dir}")
-        print(f"Metrics: results/training_metrics.csv")
-        print("\nRun 'python scripts/compare_training.py' to see comparison")
-        print()
+        print(f"\n✓ Training complete: {training_time/3600:.2f} hours")
+        print(f"✓ Model saved to {final_dir}\n")
 
 
 if __name__ == "__main__":

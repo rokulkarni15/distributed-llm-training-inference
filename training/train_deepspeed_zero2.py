@@ -1,21 +1,20 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
-DeepSpeed ZeRO-2 training: PyTorch + LoRA + DeepSpeed ZeRO-2 on 1-4 GPUs.
+DeepSpeed ZeRO-2 training: Works with 1, 2, or 4 GPUs
 
 Usage:
-    # Single GPU
-    python training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
+    # 1 GPU
+    deepspeed --num_gpus=1 training/train_zero2.py --deepspeed configs/ds_config_zero2.json
     
-    # Multi-GPU (2, 3, or 4 GPUs)
-    torchrun --nproc_per_node=2 training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
-    torchrun --nproc_per_node=3 training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
-    torchrun --nproc_per_node=4 training/train_deepspeed_zero2.py --dataset_path ./data/glaive_code_full --resume_from_checkpoint
+    # 4 GPUs
+    deepspeed --num_gpus=4 training/train_zero2.py --deepspeed configs/ds_config_zero2.json
 """
 
 import os
 import argparse
 import time
 import torch
+import csv
 from datasets import load_from_disk
 from transformers import (
     AutoModelForCausalLM,
@@ -23,7 +22,9 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
+    TrainerCallback
 )
+
 from peft import LoraConfig, get_peft_model, TaskType
 
 from utils import (
@@ -37,49 +38,56 @@ from utils import (
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Fine-tune Llama 2 7B with LoRA + DeepSpeed ZeRO-2 (1-4 GPUs)"
+        description="Fine-tune with DeepSpeed ZeRO-2"
     )
     
     parser.add_argument(
         "--model_name",
         type=str,
         default="meta-llama/Llama-2-7b-hf",
-        help="Base model to fine-tune"
+        help="Base model"
     )
     
     parser.add_argument(
         "--dataset_path",
         type=str,
         default="./data/glaive_code_full",
-        help="Path to preprocessed dataset"
+        help="Preprocessed dataset path"
     )
     
     parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
-        help="Directory to save checkpoints (auto-generated if not provided)"
+        help="Checkpoint directory (auto-generated if not provided)"
     )
     
     parser.add_argument(
         "--num_train_epochs",
         type=int,
         default=3,
-        help="Number of training epochs"
+        help="Number of epochs"
+    )
+    
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=-1,
+        help="Maximum training steps (overrides num_train_epochs if set)"
     )
     
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=1,
+        default=2,
         help="Batch size per GPU"
     )
     
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
-        help="Gradient accumulation steps"
+        default=4,
+        help="Gradient accumulation"
     )
     
     parser.add_argument(
@@ -96,195 +104,269 @@ def parse_args():
         help="LoRA rank"
     )
     
-    # DeepSpeed config argument
     parser.add_argument(
-        "--deepspeed_config",
+        "--deepspeed",
         type=str,
-        default="./configs/ds_config_zero2.json",
-        help="Path to DeepSpeed config file"
-    )
-    
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        action="store_true",
-        help="Resume from last checkpoint if available"
+        required=True,
+        help="DeepSpeed config file"
     )
     
     parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
-        help="Local rank for distributed training (automatically set by torchrun)"
+        help="Local rank for distributed training"
+    )
+    
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from"
     )
     
     return parser.parse_args()
 
 
-def main():
+def save_checkpoint_metrics(metrics, file_path=f"results/checkpoint_metrics{parse_args().local_rank}.csv"):
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
     
-    os.environ["DS_BUILD_OPS"] = "0"
-    os.environ["DS_BUILD_CPU_ADAM"] = "0"
-    os.environ["DS_BUILD_FUSED_ADAM"] = "0"
-    os.environ["DS_BUILD_UTILS"] = "0"
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0"
+    file_exists = os.path.isfile(file_path)
+    
+    with open(file_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=metrics.keys())
+        
+        # Write header if file didn't exist
+        if not file_exists:
+            writer.writeheader()
+        
+        writer.writerow(metrics)
 
+class SetStaticGraphCallback(TrainerCallback):
+    """Set static graph for DDP after model is wrapped"""
+    def on_train_begin(self, args, state, control, model, **kwargs):
+        if torch.distributed.is_initialized() and torch.cuda.device_count() > 1:
+            # Model is now wrapped in DDP, set static graph
+            if hasattr(model, '_set_static_graph'):
+                model._set_static_graph()
+                if args.local_rank == 0:
+                    print("✓ DDP static graph enabled")     
+        
+class SaveMetricsOnCheckpoint(TrainerCallback):
+
+    def __init__(self):
+        self.start_time = time.time()
+
+    def on_save(self, args, state, control, **kwargs):
+        # Time since training started
+        elapsed_seconds = time.time() - self.start_time
+        
+        # Safe extraction of last log entry
+        last_log = state.log_history[-1] if len(state.log_history) > 0 else {}
+        
+        metrics = {
+            "global_step": state.global_step,
+            "training_time_hours": elapsed_seconds / 3600,
+            "loss": last_log.get("loss"),
+            "learning_rate": last_log.get("learning_rate"),
+            "epoch": state.epoch,
+            "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9,
+        }
+        
+        save_checkpoint_metrics(metrics)
+        
+def main():
     """Main training function."""
+    
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parse_args()
     
-    # Detect distributed setup
-    local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    is_distributed = world_size > 1
-    is_main_process = local_rank in [-1, 0]
-    
-    # Detect ZeRO stage and create experiment name
-    zero_stage = get_zero_stage_from_config(args.deepspeed_config)
-    experiment_name = create_experiment_name(world_size, zero_stage)
+    # Detect GPU count and ZeRO stage
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    zero_stage = get_zero_stage_from_config(args.deepspeed)
+    experiment_name = create_experiment_name(num_gpus, zero_stage)
     
     # Set output directory based on experiment
     if args.output_dir is None:
         args.output_dir = f"./checkpoints/{experiment_name}"
     
-    # Only print from main process
-    if is_main_process:
+    # Only print on main process
+    if args.local_rank <= 0:
         print("\n" + "="*70)
         print(f"DEEPSPEED ZeRO-{zero_stage} TRAINING")
         print("="*70)
         print(f"\nExperiment: {experiment_name}")
-        print(f"GPUs: {world_size}")
+        print(f"GPUs: {num_gpus}")
         print(f"ZeRO Stage: {zero_stage}")
-        print(f"Config: {args.deepspeed_config}")
+        print(f"Config: {args.deepspeed}")
         print(f"Output: {args.output_dir}")
         print()
-        print(f"NOTE: Using DeepSpeed ZeRO-{zero_stage} for optimizer + gradient state partitioning")
-        if is_distributed:
-            print(f"Expected: Greater memory savings + {world_size}x speedup with {world_size} GPUs")
+        
+        if num_gpus == 1:
+            print("NOTE: Running on 1 GPU with ZeRO-2 optimizer state partitioning")
         else:
-            print("Expected: Lower memory usage than ZeRO-1, similar speed on 1 GPU")
+            print(f"NOTE: Running on {num_gpus} GPUs with ZeRO-2 optimizer state partitioning across all GPUs")
         print()
     
-    # Check GPU
+    # Check CUDA
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
     
-    if is_main_process:
-        if is_distributed:
-            print(f"Distributed Training: {world_size} GPUs")
-            for i in range(world_size):
-                print(f"  GPU {i}: {torch.cuda.get_device_name(0)}")
-        else:
-            print(f"Single GPU Training")
-            print(f"  GPU: {torch.cuda.get_device_name(0)}")
-            print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    
     # Load tokenizer
-    if is_main_process:
-        print("\n[1/5] Loading tokenizer...")
+    if args.local_rank <= 0:
+        print("[1/5] Loading tokenizer...")
+    
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    if is_main_process:
+    if args.local_rank <= 0:
         print("Tokenizer loaded")
     
     # Load model
-    if is_main_process:
-        print("\n[2/5] Loading model...")
+    if args.local_rank <= 0:
+        print("[2/5] Loading model...")
     
-    # For distributed training, load model differently
-    if is_distributed:
-        # Don't use device_map="auto" for multi-GPU, let DeepSpeed handle it
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            torch_dtype=torch.float16,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        torch_dtype=torch.float16,
+    )
+    torch.cuda.empty_cache()
     
-    if is_main_process:
+    if args.local_rank <= 0:
         print("Model loaded")
     
-    # Apply LoRA
-    if is_main_process:
-        print(f"\n[3/5] Applying LoRA (r={args.lora_r})...")
+    if args.local_rank <= 0:
+        print(f"[3/5] Applying LoRA (r={args.lora_r})...")
+
+   
     lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_r,
-        lora_alpha=args.lora_r * 2,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        r=args.lora_r,                           # From command line (32)
+        lora_alpha=args.lora_r * 2,              # HARD-CODED: 2x rank = 64
+        lora_dropout=0.05,                       # HARD-CODED: slight dropout
+        
+        # HARD-CODED: Target ALL attention + MLP modules
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",      # Attention
+            "gate_proj", "up_proj", "down_proj"          # MLP layers
+        ],
+        
         bias="none",
+        task_type="CAUSAL_LM"
     )
-    
+
     model = get_peft_model(model, lora_config)
     
     model.enable_input_require_grads()
-    
-    if is_main_process:
+
+    if args.local_rank <= 0:
         model.print_trainable_parameters()
         print("LoRA applied")
     
     # Load dataset
-    if is_main_process:
-        print("\n[4/5] Loading dataset...")
+    if args.local_rank <= 0:
+        print("[4/5] Loading dataset...")
+
     if not os.path.exists(args.dataset_path):
         raise FileNotFoundError(f"Dataset not found: {args.dataset_path}")
-    
+
     dataset = load_from_disk(args.dataset_path)
-    
+
+    if isinstance(dataset, dict) or hasattr(dataset, 'keys'):
+        if "validation" not in dataset:
+            print("Splitting train set into train/validation...")
+            split_dataset = dataset["train"].train_test_split(test_size=0.05, seed=42)
+            train_dataset = split_dataset["train"]
+            eval_dataset = split_dataset["test"]
+        else:
+            train_dataset = dataset["train"]
+            eval_dataset = dataset["validation"]
+    else:
+        print("Splitting dataset into train/validation...")
+        split_dataset = dataset.train_test_split(test_size=0.05, seed=42)
+        train_dataset = split_dataset["train"]
+        eval_dataset = split_dataset["test"]
+
+    print(f"Train samples: {len(train_dataset):,}")
+    print(f"Validation samples: {len(eval_dataset):,}")
+
     def tokenize(examples):
         return tokenizer(
             examples["text"],
             truncation=True,
             max_length=512,
-            padding=False,
+            padding=False,  # Don't pad during tokenization, let the data collator handle padding
         )
-    
-    tokenized = dataset.map(
+
+    # Tokenize the train and evaluation datasets separately
+    if args.local_rank <= 0:
+        print("Tokenizing train dataset...")
+    train_dataset = train_dataset.map(
         tokenize,
         batched=True,
-        remove_columns=dataset.column_names,
-        desc="Tokenizing" if is_main_process else None,
+        remove_columns=train_dataset.column_names,
+        desc="Tokenizing train dataset"
     )
-    
-    if is_main_process:
-        print(f"Dataset ready: {len(tokenized):,} samples")
-    
-    # Training setup with DeepSpeed
-    if is_main_process:
-        print("\n[5/5] Configuring training with DeepSpeed...")
-    
+
+    if args.local_rank <= 0:
+        print("Tokenizing evaluation dataset...")
+    eval_dataset = eval_dataset.map(
+        tokenize,
+        batched=True,
+        remove_columns=eval_dataset.column_names,
+        desc="Tokenizing evaluation dataset"
+    )
+
+    if args.local_rank <= 0:
+        print(f"Tokenized datasets ready:")
+        print(f"Train samples: {len(train_dataset):,}")
+        print(f"Validation samples: {len(eval_dataset):,}")
     training_args = TrainingArguments(
         output_dir=args.output_dir,
+        
         num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps if args.max_steps > 0 else -1,
+        
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        
         learning_rate=args.learning_rate,
+        lr_scheduler_type="constant",
+        warmup_ratio=0.01,  # Reduced from 0.05 for faster warmup
         
-        # DeepSpeed integration
-        deepspeed=args.deepspeed_config,
+        optim="adamw_torch",
+        weight_decay=0.01,
+        max_grad_norm=1.0,
         
-        # Memory optimization (DeepSpeed will handle fp16)
-        gradient_checkpointing=True,
         fp16=True,
-        # Logging
-        logging_steps=10,
-        logging_dir=f"{args.output_dir}/logs",
+        gradient_checkpointing=True,
         
-        # Saving - Save more frequently for cluster resilience
+        # Critical changes for stability
+        eval_strategy="steps",
+        eval_steps=500,  # More frequent evaluation to monitor progress
+        per_device_eval_batch_size=4,
+        
+        logging_steps=25,  # More frequent logging to monitor progress
+        logging_first_step=True,
+        
         save_strategy="steps",
-        save_steps=100,  # Save every 100 steps
-        save_total_limit=3,  # Keep last 3 checkpoints
+        save_steps=500,  # More frequent saves
+        save_total_limit=3,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
         
-        # Distributed training settings
-        ddp_find_unused_parameters=False,
+        # Key changes to prevent hanging
+        dataloader_num_workers=0,  # Disable multiprocessing to avoid tokenizer fork issues
+        dataloader_pin_memory=True,
+        remove_unused_columns=False,
         
-        # Disable reporting
+        # Additional stability settings
+        dataloader_drop_last=True,  # Avoid partial batches that can cause issues
+        disable_tqdm=False,  # Keep progress bars
+        
         report_to="none",
+        local_rank=args.local_rank,
+        seed=42,
     )
     
     data_collator = DataCollatorForLanguageModeling(
@@ -292,49 +374,40 @@ def main():
         mlm=False,
     )
     
+    
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,      # ADDED THIS for evaluation
         data_collator=data_collator,
+        callbacks=[SaveMetricsOnCheckpoint(), SetStaticGraphCallback()]
     )
+
     
-    # Check for existing checkpoint
-    resume_checkpoint = None
-    if args.resume_from_checkpoint and is_main_process:
-        if os.path.exists(args.output_dir):
-            checkpoints = [d for d in os.listdir(args.output_dir) 
-                          if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_dir, d))]
-            if checkpoints:
-                # Get the latest checkpoint
-                latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("-")[1]))
-                resume_checkpoint = os.path.join(args.output_dir, latest_checkpoint)
-                print(f"\n✓ Found checkpoint: {resume_checkpoint}")
-                print("  Training will resume from this checkpoint")
-            else:
-                print("\n✓ No checkpoint found, starting fresh training")
-    
-    if is_main_process:
-        print("✓ Trainer configured with DeepSpeed ZeRO-2")
-        total_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps * world_size
-        print(f"\nEffective batch size: {total_batch_size}")
-        print(f"  = {args.per_device_train_batch_size} (per_device) × {args.gradient_accumulation_steps} (grad_accum) × {world_size} (GPUs)")
+    if args.local_rank <= 0:
+        print("✓ Trainer configured")
+        effective_bs = args.per_device_train_batch_size * args.gradient_accumulation_steps * num_gpus
+        print(f"Effective batch size: {effective_bs}")
     
     # Train
-    if is_main_process:
+    # Train
+    if args.local_rank <= 0:
         print("\n" + "="*70)
         print(f"STARTING TRAINING: {experiment_name.upper()}")
+        if args.resume_from_checkpoint:
+            print(f"RESUMING FROM: {args.resume_from_checkpoint}")
         print("="*70)
         print()
-    
+
     start_time = time.time()
-    
-    trainer.train(resume_from_checkpoint=resume_checkpoint)
-    
+
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+
     training_time = time.time() - start_time
     
-    # Save and collect metrics (only main process)
-    if is_main_process:
+    # Save and collect metrics
+    if args.local_rank <= 0:
         print("\n" + "="*70)
         print("SAVING MODEL")
         print("="*70)
@@ -350,9 +423,9 @@ def main():
         print("COLLECTING METRICS")
         print("="*70)
         
-        num_samples = len(tokenized)
+        num_samples = len(train_dataset)
         
-        # Get final loss from training history
+        # Get final loss
         train_history = trainer.state.log_history
         final_loss = None
         for entry in reversed(train_history):
@@ -360,10 +433,10 @@ def main():
                 final_loss = entry['loss']
                 break
         
-        # Prepare metrics dictionary
+        # Metrics
         metrics = {
             "experiment": experiment_name,
-            "num_gpus": world_size,
+            "num_gpus": num_gpus,
             "zero_stage": zero_stage,
             "strategy": f"deepspeed_zero{zero_stage}",
             "training_time_hours": training_time / 3600,
@@ -372,9 +445,9 @@ def main():
             "final_loss": final_loss if final_loss is not None else 0.0,
         }
         
-        # Print and save metrics
+        # Print and save
         print_metrics_summary(metrics)
-        save_training_metrics(metrics)
+        save_training_metrics(metrics, csv_path=f"results/training_metrics_gpu{args.local_rank}.csv")
         
         # Final summary
         print("\n" + "="*70)
