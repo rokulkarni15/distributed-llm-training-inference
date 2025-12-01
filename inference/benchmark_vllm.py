@@ -62,7 +62,7 @@ class BenchmarkResult:
 class VLLMBenchmark:
     """vLLM inference benchmarking."""
     
-    def __init__(self, base_url: str, model_name: str = "model"):
+    def __init__(self, base_url: str, model_name: str):
         self.client = AsyncOpenAI(
             base_url=f"{base_url}/v1",
             api_key="dummy",
@@ -165,6 +165,7 @@ async def run_benchmark(
     num_gpus: int,
     num_requests: int,
     concurrency_levels: List[int],
+    model_name: str
 ):
     """Run full benchmark suite."""
     
@@ -176,7 +177,7 @@ async def run_benchmark(
     print(f"Concurrency levels: {concurrency_levels}")
     print()
     
-    benchmark = VLLMBenchmark(base_url)
+    benchmark = VLLMBenchmark(base_url, model_name)
     
     # Generate test prompts
     test_prompts = [
@@ -284,6 +285,13 @@ def main():
         default="1,4,8,16,32,64",
         help="Comma-separated concurrency levels to test"
     )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="./merged_model/zero2_4gpu", 
+        help="Model name for API requests"
+    )
     
     args = parser.parse_args()
     
@@ -305,6 +313,7 @@ def main():
         num_gpus=args.num_gpus,
         num_requests=args.num_requests,
         concurrency_levels=concurrency_levels,
+        model_name=args.model,
     ))
     
     # Save results

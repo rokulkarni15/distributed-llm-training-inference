@@ -13,6 +13,7 @@ import sys
 import os
 
 
+
 def load_and_calculate():
     """Load results and calculate speedup/efficiency."""
     

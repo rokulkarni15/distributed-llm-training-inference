@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import sys
+import numpy as np
 
 
 def load_results(csv_path="results/inference_metrics.csv"):

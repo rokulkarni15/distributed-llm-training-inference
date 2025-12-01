@@ -8,6 +8,8 @@ Usage:
     
     # 4 GPUs
     deepspeed --num_gpus=4 training/train_zero2.py --deepspeed configs/ds_config_zero2.json
+
+    # deepspeed --num_gpus=4 training/train_deepspeed_zero2.py --deepspeed configs/ds_config_zero2.json --max_steps=7500
 """
 
 import os
@@ -231,6 +233,7 @@ def main():
         args.model_name,
         torch_dtype=torch.float16,
     )
+    model.config.use_cache = False
     torch.cuda.empty_cache()
     
     if args.local_rank <= 0:
@@ -241,9 +244,9 @@ def main():
 
    
     lora_config = LoraConfig(
-        r=args.lora_r,                           # From command line (32)
-        lora_alpha=args.lora_r * 2,              # HARD-CODED: 2x rank = 64
-        lora_dropout=0.05,                       # HARD-CODED: slight dropout
+        r=args.lora_r,                           
+        lora_alpha=args.lora_r * 2,            
+        lora_dropout=0.05,                      
         
         # HARD-CODED: Target ALL attention + MLP modules
         target_modules=[
@@ -321,6 +324,7 @@ def main():
         print(f"Tokenized datasets ready:")
         print(f"Train samples: {len(train_dataset):,}")
         print(f"Validation samples: {len(eval_dataset):,}")
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         
@@ -339,8 +343,9 @@ def main():
         max_grad_norm=1.0,
         
         fp16=True,
-        gradient_checkpointing=True,
-        
+        gradient_checkpointing=False,
+        # DDP settings
+        ddp_find_unused_parameters=False,
         # Critical changes for stability
         eval_strategy="steps",
         eval_steps=500,  # More frequent evaluation to monitor progress
@@ -379,9 +384,9 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,      # ADDED THIS for evaluation
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
-        callbacks=[SaveMetricsOnCheckpoint(), SetStaticGraphCallback()]
+        callbacks=[SaveMetricsOnCheckpoint()]
     )
 
     
